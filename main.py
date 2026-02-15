@@ -12,7 +12,7 @@ st.title("🌎 Multi-Exchange Semi-Automated Intraday Engine (TSX/NASDAQ/NYSE)")
 # --- SETTINGS ---
 INITIAL_CAPITAL = 100000
 TOP_N = 5
-REFRESH_INTERVAL = 60
+REFRESH_INTERVAL = 60  # seconds
 STOP_LOSS = 0.5
 TAKE_PROFIT = 1.0
 TRAILING_STOP = True
@@ -56,7 +56,7 @@ for exchange, tickers in stocks.items():
     results = []
     for ticker in tickers:
         try:
-            df = yf.download(ticker, period="7d", interval="15m", progress=False)
+            df = yf.download(ticker, period="7d", interval="5m", progress=False)
             if df.empty:
                 continue
             if isinstance(df.columns, pd.MultiIndex):
@@ -71,17 +71,32 @@ for exchange, tickers in stocks.items():
 tabs = st.tabs(["TSX", "NASDAQ", "NYSE"])
 for i, exchange in enumerate(["TSX", "NASDAQ", "NYSE"]):
     with tabs[i]:
-        df_signals = exchange_results[exchange]
-        buy_signals = df_signals[df_signals["Signal"]==1].sort_values(by="Score", ascending=False)
-        top_buys = buy_signals.head(TOP_N)
-        st.subheader(f"🏆 Top {TOP_N} Buy Signals - {exchange}")
-        st.dataframe(top_buys[["Stock","Price","Score"]])
+        df = exchange_results[exchange]
+        if df.empty:
+            st.warning(f"No valid intraday data for {exchange} stocks.")
+            continue
 
-        # --- OPEN POSITIONS ---
-        total_score = top_buys["Score"].sum() if not top_buys.empty else 1
-        for _, row in top_buys.iterrows():
+        # --- TOP BUY SIGNALS ---
+        buy_signals = df[df["Signal"]==1].sort_values(by="Score", ascending=False).head(TOP_N)
+        top_signals_list = []
+        for _, row in buy_signals.iterrows():
+            buy_price = row["Price"]
+            sell_price = buy_price * (1 + TAKE_PROFIT/100)
+            top_signals_list.append({
+                "Stock": row["Stock"],
+                "Buy Price": round(buy_price,2),
+                "Sell Price": round(sell_price,2),
+                "Score": round(row["Score"],2)
+            })
+        df_top_signals = pd.DataFrame(top_signals_list)
+        st.subheader(f"🏆 Top {TOP_N} Buy Signals - {exchange}")
+        st.dataframe(df_top_signals)
+
+        # --- OPEN POSITIONS BASED ON TOP SIGNALS ---
+        total_score = df_top_signals["Score"].sum() if not df_top_signals.empty else 1
+        for _, row in df_top_signals.iterrows():
             ticker = row["Stock"]
-            price = row["Price"]
+            price = row["Buy Price"]
             score = row["Score"]
             allocation = st.session_state.capital * (score / total_score)
             shares = allocation // price
@@ -99,19 +114,22 @@ for i, exchange in enumerate(["TSX", "NASDAQ", "NYSE"]):
 
         # --- INTRADAY CHARTS ---
         st.subheader(f"📊 Intraday Charts - {exchange} Top Buys")
-        for _, row in top_buys.iterrows():
+        for _, row in buy_signals.iterrows():
             ticker = row["Stock"]
-            df = row["DF"]
+            df_c = row["DF"]
             pos_list = st.session_state.positions.get(ticker, [])
             fig = go.Figure()
-            fig.add_trace(go.Candlestick(x=df.index, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"], name="Price"))
-            fig.add_trace(go.Scatter(x=df.index, y=df["EMA10"], mode="lines", name="EMA10"))
-            fig.add_trace(go.Scatter(x=df.index, y=df["EMA30"], mode="lines", name="EMA30"))
+            fig.add_trace(go.Candlestick(
+                x=df_c.index, open=df_c["Open"], high=df_c["High"], low=df_c["Low"], close=df_c["Close"], name="Price"))
+            fig.add_trace(go.Scatter(x=df_c.index, y=df_c["EMA10"], mode="lines", name="EMA10"))
+            fig.add_trace(go.Scatter(x=df_c.index, y=df_c["EMA30"], mode="lines", name="EMA30"))
 
-            buy_idx = df[(df["EMA10"] > df["EMA30"]) & (df["RSI7"] < 70)].index
-            sell_idx = df[(df["EMA10"] < df["EMA30"]) & (df["RSI7"] > 30)].index
-            fig.add_trace(go.Scatter(x=buy_idx, y=df.loc[buy_idx,"Close"], mode="markers", name="Buy", marker=dict(symbol="triangle-up", size=12, color="green")))
-            fig.add_trace(go.Scatter(x=sell_idx, y=df.loc[sell_idx,"Close"], mode="markers", name="Sell", marker=dict(symbol="triangle-down", size=12, color="red")))
+            buy_idx = df_c[(df_c["EMA10"] > df_c["EMA30"]) & (df_c["RSI7"] < 70)].index
+            sell_idx = df_c[(df_c["EMA10"] < df_c["EMA30"]) & (df_c["RSI7"] > 30)].index
+            fig.add_trace(go.Scatter(x=buy_idx, y=df_c.loc[buy_idx,"Close"], mode="markers", name="Buy",
+                                     marker=dict(symbol="triangle-up", size=12, color="green")))
+            fig.add_trace(go.Scatter(x=sell_idx, y=df_c.loc[sell_idx,"Close"], mode="markers", name="Sell",
+                                     marker=dict(symbol="triangle-down", size=12, color="red")))
 
             for pos in pos_list:
                 if pos["status"]=="open":
@@ -122,18 +140,43 @@ for i, exchange in enumerate(["TSX", "NASDAQ", "NYSE"]):
             fig.update_layout(xaxis_rangeslider_visible=False, title=f"{ticker} Intraday Chart", height=600)
             st.plotly_chart(fig, use_container_width=True)
 
+# --- CHECK POSITIONS FOR SL/TP/TRAILING STOP ---
+for ticker, pos_list in st.session_state.positions.items():
+    df_price = None
+    for exchange_df in exchange_results.values():
+        if ticker in exchange_df["Stock"].values:
+            df_price = exchange_df[exchange_df["Stock"]==ticker]["Price"].values[0]
+            break
+    if df_price is None:
+        continue
+    for pos in pos_list:
+        if pos["status"]=="open":
+            if TRAILING_STOP:
+                pos["trailing_stop"] = max(pos["trailing_stop"], df_price * (1 - STOP_LOSS/100))
+            if df_price <= pos["trailing_stop"]:
+                pos["status"]="closed"
+                st.session_state.capital += pos["shares"] * df_price
+                alert_text = f"⚠️ {ticker} closed by Trailing Stop at ${df_price:.2f}"
+                st.session_state.alerts.append(alert_text)
+                st.toast(alert_text)
+            elif df_price >= pos["take_profit"]:
+                pos["status"]="closed"
+                st.session_state.capital += pos["shares"] * df_price
+                alert_text = f"✅ {ticker} closed by Take-Profit at ${df_price:.2f}"
+                st.session_state.alerts.append(alert_text)
+                st.toast(alert_text)
+
 # --- UPDATE EQUITY CURVE ---
 total_value = st.session_state.capital
 for ticker, pos_list in st.session_state.positions.items():
-    for pos in pos_list:
-        if pos["status"]=="open":
-            df_price = None
-            for exchange in exchange_results:
-                df_exchange = exchange_results[exchange]
-                if ticker in df_exchange["Stock"].values:
-                    df_price = df_exchange[df_exchange["Stock"]==ticker]["Price"].values[0]
-                    break
-            if df_price is not None:
+    df_price = None
+    for exchange_df in exchange_results.values():
+        if ticker in exchange_df["Stock"].values:
+            df_price = exchange_df[exchange_df["Stock"]==ticker]["Price"].values[0]
+            break
+    if df_price is not None:
+        for pos in pos_list:
+            if pos["status"]=="open":
                 total_value += pos["shares"] * df_price
 st.session_state.equity_curve.append(total_value)
 
